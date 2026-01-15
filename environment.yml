@@ -1,0 +1,10 @@
+name: crispyAccess
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - pywin32
+  - pywinauto
+  - pyautogui
+  - keyboard
+prefix: C:\Users\cwbaxter\miniconda3\envs\crispyAccess
