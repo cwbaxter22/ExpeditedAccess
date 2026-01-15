@@ -6,7 +6,9 @@ import sys
 # CONFIGURATION
 APP_TITLE = "Area Access Manager"
 NETIDS = ["adwitv", "bryan747"]
-DELAY = 8.0
+CLICK_DELAY = 0.25
+KEY_DELAY = 0.05
+BETWEEN_USERS_DELAY = 1.0
 
 # Debug: prints each automated action so you can spot any extra click/keypress.
 DEBUG_ACTIONS = True
@@ -19,11 +21,6 @@ ASSIGN_ACCESS_OFFSET = (465, 59)
 # Wizard-step coordinates (relative to the MAIN window client area)
 TAB_2_CLICK_REL = (665, 304)
 NETID_FIELD_CLICK_REL = (1006, 441)
-NEXT_BUTTON_REL = (1151, 843)
-SET_ACTIVATION_DATES_REL = (627, 259)
-ACTIVATION_DATES_OK_REL = (1102, 773)
-NEXT_BUTTON_2_REL = (1144, 842)
-FINAL_OK_REL = (1104, 566)
 
 print("Connecting to application...")
 print("(Press Ctrl+C anytime to abort the program)\n")
@@ -62,6 +59,8 @@ try:
         exit(1)
 
     for netid in NETIDS:
+        # Give the confirmation popup time to close before starting next user
+        time.sleep(BETWEEN_USERS_DELAY)
         print(f"Processing {netid}")
         
         try:
@@ -71,7 +70,7 @@ try:
             time.sleep(0.3)
             log_action(f"CLICK Assign Access @ {ASSIGN_ACCESS_OFFSET}")
             main_win32.click_input(coords=ASSIGN_ACCESS_OFFSET)
-            time.sleep(DELAY)
+            time.sleep(CLICK_DELAY)
             
             # Get the wizard window and its position
             print(f"   Waiting for wizard window...")
@@ -95,22 +94,17 @@ try:
             # Click 2nd tab (People)
             print(f"   Clicking 2nd tab")
             click_main(TAB_2_CLICK_REL)
-            time.sleep(DELAY)
+            time.sleep(CLICK_DELAY)
             
             # Click NetID field
             print(f"   Clicking NetID field and entering {netid}")
             click_main(NETID_FIELD_CLICK_REL)
-            time.sleep(0.5)
+            time.sleep(CLICK_DELAY)
             
-            # Clear the field first (Ctrl+A to select all, then delete)
-            #press('ctrl+a')
-            #time.sleep(0.1)
-            #press('delete')
-            #time.sleep(0.1)
-            
+                      
             # Type the NetID
             keyboard.write(netid)
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             # Next (Step 1/4 -> 2/4): Enter
             print(f"   Next (Step 1/4  2/4) via Enter")
@@ -119,7 +113,7 @@ try:
             except Exception:
                 pass
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             # Next (Step 2/4 -> 3/4): Enter
             print(f"   Next (Step 2/4  3/4) via Enter")
@@ -128,7 +122,7 @@ try:
             except Exception:
                 pass
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
 
             # Set Activation Dates: Tab, then Enter
@@ -138,14 +132,14 @@ try:
             except Exception:
                 pass
             press('tab')
-            time.sleep(0.1)
+            time.sleep(KEY_DELAY)
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             # OK in Activation Dates popup: Enter
             print(f"   OK in Activation Dates popup via Enter")
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             # Next (Step 3/4 -> 4/4): Tab x4, then Enter
             print(f"   Next (Step 3/4  4/4) via Tab x4 + Enter")
@@ -155,9 +149,9 @@ try:
                 pass
             for _ in range(4):
                 press('tab')
-                time.sleep(0.05)
+                time.sleep(KEY_DELAY)
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             # Finish: Enter
             print(f"   Finish via Enter")
@@ -166,7 +160,7 @@ try:
             except Exception:
                 pass
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
 
             # Click OK in final confirmation popup
@@ -179,7 +173,7 @@ try:
                 pass
             time.sleep(0.2)
             press('enter')
-            time.sleep(DELAY)
+            time.sleep(KEY_DELAY)
             
             print(f" Completed {netid}\n")
             
