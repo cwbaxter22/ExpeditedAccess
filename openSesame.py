@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 import ctypes
@@ -19,6 +24,8 @@ from pywinauto import Application, findwindows
 # ----------------------------
 
 APP_TITLE = "Area Access Manager"
+
+REPO_URL = "https://github.com/cwbaxter22/ExpeditedAccess"
 
 # Set by the GUI at runtime so the automation can request a user-driven Resume.
 _RESUME_HOOKS = None
@@ -39,35 +46,72 @@ class Config:
 
 DISCLAIMER_TEXT = (
     "DISCLAIMER: THIS PROGRAM WILL ONLY WORK IF AREA ACCESS MANAGER IS SCALED CORRECTLY AND OPEN.\n"
-    "Sometimes, on laptops for example, Area Access Manager will show up as smaller than usual. "
+    "Sometimes, on laptops for example, Area Access Manager will show up as smaller than usual, or tabs can block each other after clicking 'Assign Access'.\n"
     "This will create a coordinate error and cause the program to fail.\n"
-    "Sometimes, this can be corrected through adjustments made on the Advanced Tab.\n"
-    "The program works through a combination of moving the mouse to coordinates and clicking, and sending keyboard input.\n"
+    "Generally, this can be corrected through corrections on the Set-Up tab."
+    "The program works through a combination of moving your cursor to coordinates and clicking, and sending keyboard input.\n"
     "DO NOT MOVE THE MOUSE DURING OPERATION\n\n"
-    "SETUP:\n"
-    "1) Open Area Access Manager\n"
-    "2) Confirm scaling is correct\n"
-    "3) Enter UW NetIDs each on a new line in the Input Box\n"
+    "OPERATION:\n"
+    "1) Open Area Access Manager on one display and this program on another\n"
+    "It is helpful to be able to see the output log, but not required."
+    "2) Confirm scaling is correct, check coordinates on Set-Up tab\n"
+    "3) Enter UW NetIDs each on a new line (Shift + Enter) in the Input Box\n"
     "4) Note the location of the \"ABORT\" button incase steps 5 and 6 malfunction\n"
-    "After STEP 5, do not touch the mouse unless you need to click \"ABORT\"\n"
+    "After STEP 5, do not touch the mouse unless you need to click \"ABORT\", or the program prompts you.\n"
     "5) Press \"Assign Access\"\n"
-    "6) Supervise the first batch to confirm there are no coordinate errors\n"
+    "6) Supervise the first batch to confirm there are no errors\n"
+    "If a NetID has a typo, a message will appear in the log and the program will PAUSE until a correction has been made.\n"
     "7) Once access has been assigned to all users, click the top of the \"Activate\" column on Area Access Manager to sort by newest access granted first\n"
     "8) Select the NetIDs that were just added and set specific dates and times"
 )
 
 
 ADVANCED_HELP_TEXT = (
-    "If the program runs into an error in the clicking portion, the culprit may be a differently scaled screen. "
-    "You can press the \"Coord Check\" button to get a read-out of what the coordinates are of your mouse on Area Access Manager in real-time.\n"
+    "Complete the following steps when running the program for the first time on a new device, or if clicks are missing targets:\n\n"
     "1) Open Area Access Manager\n"
     "2) Press Coord Check button\n"
-    "3) Hover over the \"Assign Access\" yellow button, \"UWID\" tab on the pop-up, and anywhere on the \"NetID\" text entry box.\n"
-    "4) Note the coordinates for each and update them on the advanced tab\n\n"
-    "Another error the program can encounter is moving more quickly than Area Access Manager can keep up.\n"
+    "3) Hover over the \"Assign Access\" yellow button.\n"
+    "4) Note the coordinates for this cursor location and update them in the Coordinates section.\n"
+    "5) Repeat this process for the UWID tab and NetID field.\n\n"
+    "Another error the program can encounter is moving too quickly- i.e. faster than Area Access Manager can keep up with.\n"
     "In this situation, try increasing the time for the Click, Key, and Between-Users delays.\n"
-    "Start with the Between-Users, then Click, and then Key."
+    "Start with the Click, then Between Users, and then Key delay.\n\n"
+    "These settings can be saved for future runs by pressing the Save Settings button."
 )
+
+
+def _settings_file_path() -> Path:
+    base = os.getenv("APPDATA") or str(Path.home())
+    return Path(base) / "ExpeditedAccess" / "settings.json"
+
+
+def _default_config() -> Config:
+    # Always reflect the in-file defaults as they exist right now.
+    return Config()
+
+
+def _config_to_dict(cfg: Config) -> dict:
+    return {
+        "click_delay": cfg.click_delay,
+        "key_delay": cfg.key_delay,
+        "between_users_delay": cfg.between_users_delay,
+        "assign_access_offset": list(cfg.assign_access_offset),
+        "tab_2_click_rel": list(cfg.tab_2_click_rel),
+        "netid_field_click_rel": list(cfg.netid_field_click_rel),
+    }
+
+
+def _dict_to_config(d: dict) -> Config:
+    defaults = _default_config()
+    return Config(
+        click_delay=float(d.get("click_delay", defaults.click_delay)),
+        key_delay=float(d.get("key_delay", defaults.key_delay)),
+        between_users_delay=float(d.get("between_users_delay", defaults.between_users_delay)),
+        assign_access_offset=tuple(d.get("assign_access_offset", list(defaults.assign_access_offset))),
+        tab_2_click_rel=tuple(d.get("tab_2_click_rel", list(defaults.tab_2_click_rel))),
+        netid_field_click_rel=tuple(d.get("netid_field_click_rel", list(defaults.netid_field_click_rel))),
+        debug_actions=True,
+    )
 
 
 class AbortRequested(Exception):
@@ -310,8 +354,8 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
 
                 current_count = _count_visible_toplevel_windows_for_pid(main_pid)
                 log(
-                    "\nPAUSED: NetID may be invalid (popup detected).\n"
-                    "Correct the NetID typo, press 'Next' in Area Access Manager, and then press 'Resume' Here.\n"
+                    "\nPAUSED: NetID may be invalid (see pop-up on Area Access Manager).\n"
+                    "Correct the NetID typo, \npress 'Next' in Area Access Manager to confirm typo is fixed, \nand then press 'Resume' Here.\n"
                     f"(Debug: observed {current_count} Area Access Manager window(s).)\n"
                     "(No keys/clicks will be sent while paused.)\n\n"
                 )
@@ -455,15 +499,24 @@ class App(tk.Tk):
         self.title("Expedited Access")
         self.geometry("900x650")
 
-        self.cfg = Config()
+        self.settings_path = _settings_file_path()
+        self.cfg = _default_config()
+        self.show_setup_reminder = True
+        self._load_persisted_settings()
         self.abort_event = threading.Event()
         self.resume_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
+        self.current_task: str | None = None  # 'assign' | 'coord' | None
 
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
 
         self._build_ui()
+        self._apply_cfg_to_vars(self.cfg)
         self.after(50, self._drain_log_queue)
+
+        # First-run / reminder popup
+        if self.show_setup_reminder:
+            self.after(200, self._show_setup_reminder_dialog)
 
     # ---- UI ----
 
@@ -474,14 +527,36 @@ class App(tk.Tk):
         self.tab_input = ttk.Frame(notebook)
         self.tab_adv = ttk.Frame(notebook)
         notebook.add(self.tab_input, text="Input")
-        notebook.add(self.tab_adv, text="Advanced")
+        notebook.add(self.tab_adv, text="Set-up")
 
         self._build_input_tab(self.tab_input)
         self._build_advanced_tab(self.tab_adv)
 
+    def _add_repo_footer(self, parent: ttk.Frame):
+        footer = ttk.Frame(parent)
+        footer.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+
+        ttk.Label(footer, text="Software Repository:").pack(side="left")
+
+        link = tk.Label(
+            footer,
+            text=REPO_URL,
+            fg="blue",
+            cursor="hand2",
+            font=("TkDefaultFont", 9, "underline"),
+        )
+        link.pack(side="left", padx=(6, 0))
+        link.bind("<Button-1>", lambda _e: self._open_repo_url())
+
+    def _open_repo_url(self):
+        try:
+            webbrowser.open_new_tab(REPO_URL)
+        except Exception:
+            messagebox.showerror("Error", f"Could not open URL:\n{REPO_URL}")
+
     def _build_input_tab(self, parent: ttk.Frame):
         # NetIDs input
-        ttk.Label(parent, text="NetIDs - each on a newline").pack(anchor="w", padx=10, pady=(10, 0))
+        ttk.Label(parent, text="NetIDs - Each on a Newline (Shift + Enter)").pack(anchor="w", padx=10, pady=(10, 0))
         self.netids_text = tk.Text(parent, height=6)
         self.netids_text.pack(fill="x", padx=10, pady=5)
 
@@ -515,6 +590,7 @@ class App(tk.Tk):
 
         # Spacer so Output doesn't take the whole tab
         ttk.Frame(parent).pack(fill="both", expand=True)
+        self._add_repo_footer(parent)
 
     def _build_advanced_tab(self, parent: ttk.Frame):
         top = ttk.Frame(parent)
@@ -551,15 +627,18 @@ class App(tk.Tk):
         btn_row = ttk.Frame(parent)
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
-        self.btn_coord = ttk.Button(btn_row, text="Coord Check", command=self.on_coord_check)
+        self.btn_coord = ttk.Button(btn_row, text="Start/Stop Coord Check", command=self.on_coord_check)
         self.btn_coord.pack(side="left")
 
-        ttk.Button(btn_row, text="Advanced Help", command=lambda: messagebox.showinfo("Advanced Help", ADVANCED_HELP_TEXT)).pack(
+        self.btn_save_settings = ttk.Button(btn_row, text="Save Settings", command=self.on_save_settings)
+        self.btn_save_settings.pack(side="left", padx=(8, 0))
+
+        self.btn_restore_defaults = ttk.Button(btn_row, text="Restore Defaults", command=self.on_restore_defaults)
+        self.btn_restore_defaults.pack(side="left", padx=(8, 0))
+
+        ttk.Button(btn_row, text="Set-up Help", command=lambda: messagebox.showinfo("Set-up Help", ADVANCED_HELP_TEXT)).pack(
             side="left", padx=(8, 0)
         )
-
-        self.btn_abort_2 = ttk.Button(btn_row, text="ABORT", command=self.on_abort)
-        self.btn_abort_2.pack(side="right")
 
         # Output
         ttk.Label(parent, text="Output").pack(anchor="w", padx=10)
@@ -574,6 +653,7 @@ class App(tk.Tk):
 
         # Spacer so Output doesn't take the whole tab
         ttk.Frame(parent).pack(fill="both", expand=True)
+        self._add_repo_footer(parent)
 
     # ---- Validation UI helpers ----
 
@@ -668,6 +748,93 @@ class App(tk.Tk):
             debug_actions=True,
         )
 
+    def _apply_cfg_to_vars(self, cfg: Config):
+        # Delays
+        self.var_click_delay.set(str(cfg.click_delay))
+        self.var_key_delay.set(str(cfg.key_delay))
+        self.var_between_users_delay.set(str(cfg.between_users_delay))
+
+        # Coordinates
+        self.var_assign_x.set(str(cfg.assign_access_offset[0]))
+        self.var_assign_y.set(str(cfg.assign_access_offset[1]))
+        self.var_tab_x.set(str(cfg.tab_2_click_rel[0]))
+        self.var_tab_y.set(str(cfg.tab_2_click_rel[1]))
+        self.var_netid_x.set(str(cfg.netid_field_click_rel[0]))
+        self.var_netid_y.set(str(cfg.netid_field_click_rel[1]))
+
+    def _load_persisted_settings(self):
+        try:
+            if not self.settings_path.exists():
+                return
+            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            cfg_data = data.get("config") or {}
+            self.cfg = _dict_to_config(cfg_data)
+            ui_data = data.get("ui") or {}
+            self.show_setup_reminder = bool(ui_data.get("show_setup_reminder", True))
+        except Exception:
+            # Corrupt/invalid settings should not prevent launching.
+            self.cfg = _default_config()
+            self.show_setup_reminder = True
+
+    def _save_persisted_settings(self, cfg: Config | None = None, show_setup_reminder: bool | None = None):
+        try:
+            data = {}
+            if self.settings_path.exists():
+                try:
+                    data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+
+            if cfg is not None:
+                data["config"] = _config_to_dict(cfg)
+
+            if show_setup_reminder is not None:
+                data.setdefault("ui", {})
+                data["ui"]["show_setup_reminder"] = bool(show_setup_reminder)
+
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            # Saving is best-effort.
+            pass
+
+    def _show_setup_reminder_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Set-up Reminder")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        msg = (
+            "Before proceeding, please check the Set-up tab to confirm the delays and coordinates are correct.\n\n"
+            "Tip: Use 'Coord Check' if clicks are missing targets."
+        )
+
+        ttk.Label(dlg, text=msg, justify="left", wraplength=520).pack(padx=14, pady=(14, 8), anchor="w")
+
+        dont_show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dlg, text="Don't show this message again", variable=dont_show_var).pack(padx=14, pady=(0, 12), anchor="w")
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill="x", padx=14, pady=(0, 14))
+
+        def on_ok():
+            if dont_show_var.get():
+                self.show_setup_reminder = False
+                self._save_persisted_settings(show_setup_reminder=False)
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="OK", command=on_ok).pack(side="right")
+
+        # Center dialog over the main window
+        self.update_idletasks()
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() // 2) - 250
+            y = self.winfo_rooty() + (self.winfo_height() // 2) - 120
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
     # ---- Logging ----
 
     def _log(self, target: str, s: str):
@@ -692,7 +859,15 @@ class App(tk.Tk):
     def _set_running_state(self, running: bool):
         state = "disabled" if running else "normal"
         self.btn_assign.configure(state=state)
-        self.btn_coord.configure(state=state)
+
+        # Coord check uses the same button to stop.
+        if running and self.current_task == "coord":
+            self.btn_coord.configure(state="normal")
+        else:
+            self.btn_coord.configure(state=state)
+
+        self.btn_save_settings.configure(state=state)
+        self.btn_restore_defaults.configure(state=state)
         # Resume only enabled when a pause is requested
         if not running:
             self.btn_resume.configure(state="disabled")
@@ -713,6 +888,26 @@ class App(tk.Tk):
         self._set_resume_state(False)
         self._log("main", "\nRESUME pressed.\n")
 
+    def on_save_settings(self):
+        try:
+            cfg = self._read_config_from_advanced()
+        except ValueError as e:
+            messagebox.showerror("Invalid Settings", str(e))
+            return
+
+        self.cfg = cfg
+        self._save_persisted_settings(cfg=cfg)
+        self._log("adv", f"\nSaved settings to: {self.settings_path}\n")
+        self._log("main", "\nSettings saved.\n")
+
+    def on_restore_defaults(self):
+        defaults = _default_config()
+        self.cfg = defaults
+        self._apply_cfg_to_vars(defaults)
+        self._save_persisted_settings(cfg=defaults)
+        self._log("adv", f"\nRestored defaults and saved to: {self.settings_path}\n")
+        self._log("main", "\nDefaults restored and saved.\n")
+
     def on_assign_access(self):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("Busy", "A task is already running. Press ABORT to stop it.")
@@ -730,6 +925,7 @@ class App(tk.Tk):
 
         self.abort_event.clear()
         self.resume_event.clear()
+        self.current_task = "assign"
         self._set_running_state(True)
 
         # Expose resume hooks to the automation engine
@@ -751,6 +947,7 @@ class App(tk.Tk):
                 # Clear hooks when done
                 global _RESUME_HOOKS
                 _RESUME_HOOKS = None
+                self.current_task = None
                 self.after(0, lambda: self._set_running_state(False))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
@@ -758,6 +955,11 @@ class App(tk.Tk):
 
     def on_coord_check(self):
         if self.worker_thread and self.worker_thread.is_alive():
+            if self.current_task == "coord":
+                # Toggle stop
+                self.abort_event.set()
+                self._log("adv", "\nStopping coord check...\n")
+                return
             messagebox.showwarning("Busy", "A task is already running. Press ABORT to stop it.")
             return
 
@@ -768,6 +970,7 @@ class App(tk.Tk):
             return
 
         self.abort_event.clear()
+        self.current_task = "coord"
         self._set_running_state(True)
 
         # Clear coord output area; coord check will live-update x/y.
@@ -782,6 +985,7 @@ class App(tk.Tk):
             except Exception as e:
                 self._log("adv_set", f"ERROR: {e}\n")
             finally:
+                self.current_task = None
                 self.after(0, lambda: self._set_running_state(False))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
