@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 import ctypes
 
 import keyboard
-from pywinauto import Application
+from pywinauto import Application, findwindows
 
 
 # ----------------------------
@@ -20,16 +20,19 @@ from pywinauto import Application
 
 APP_TITLE = "Area Access Manager"
 
+# Set by the GUI at runtime so the automation can request a user-driven Resume.
+_RESUME_HOOKS = None
+
 
 @dataclass
 class Config:
-    click_delay: float = 0.25
+    click_delay: float = 0.05
     key_delay: float = 0.05
-    between_users_delay: float = 1.0
+    between_users_delay: float = 0.05
 
     assign_access_offset: tuple[int, int] = (465, 59)
-    tab_2_click_rel: tuple[int, int] = (665, 304)
-    netid_field_click_rel: tuple[int, int] = (1006, 441)
+    tab_2_click_rel: tuple[int, int] = (650, 300)
+    netid_field_click_rel: tuple[int, int] = (1080, 444)
 
     debug_actions: bool = True
 
@@ -75,6 +78,38 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
+_EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+
+def _get_pid_for_hwnd(hwnd: int) -> int:
+    pid = ctypes.c_ulong(0)
+    ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _count_visible_toplevel_windows_for_pid(pid: int) -> int:
+    count = 0
+
+    @ _EnumWindowsProc
+    def enum_cb(hwnd, lparam):
+        nonlocal count
+        try:
+            hwnd_int = int(hwnd)
+            if ctypes.windll.user32.IsWindowVisible(ctypes.c_void_p(hwnd_int)) == 0:
+                return True
+
+            w_pid = ctypes.c_ulong(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd_int), ctypes.byref(w_pid))
+            if int(w_pid.value) == pid:
+                count += 1
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumWindows(enum_cb, 0)
+    return count
+
+
 def _get_cursor_pos() -> tuple[int, int]:
     pt = _POINT()
     if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)) == 0:
@@ -90,10 +125,59 @@ def _sleep_or_abort(seconds: float, abort_event: threading.Event):
         time.sleep(min(0.05, end_time - time.time()))
 
 
+def _connect_single_main_window(abort_event: threading.Event, log, timeout: float = 10.0, key_delay: float = 0.05):
+    """Connect to Area Access Manager even when a second window briefly exists.
+
+    Some UI transitions can momentarily create two top-level windows with the same title,
+    which causes pywinauto's title-based lookups to raise an ambiguity error. This helper
+    waits until exactly one match exists, then connects by handle.
+    """
+
+    deadline = time.time() + timeout
+    last_count: int | None = None
+
+    while time.time() < deadline:
+        if abort_event.is_set():
+            raise AbortRequested()
+
+        try:
+            # Returns a list of ElementInfo objects (may be empty).
+            elements = findwindows.find_elements(title_re=APP_TITLE)
+            count = len(elements)
+            if count == 1:
+                handle = elements[0].handle
+                app = Application(backend="win32").connect(handle=handle)
+                win = app.window(handle=handle)
+                return app, win
+
+            # If there are 2 windows with the same title, it's often because a popup
+            # hasn't cleared yet. Press Enter and retry until only one remains.
+            if count != last_count:
+                if count > 1:
+                    log(f"Waiting for a single '{APP_TITLE}' window (found {count}). Pressing Enter to clear popups...\n")
+                else:
+                    log(f"Waiting for a single '{APP_TITLE}' window (found {count})...\n")
+                last_count = count
+
+            if count > 1:
+                keyboard.press_and_release('enter')
+                _sleep_or_abort(key_delay, abort_event)
+        except Exception:
+            # Treat lookup failures as transient; keep retrying.
+            pass
+
+        time.sleep(0.1)
+
+    raise RuntimeError(f"Timed out waiting for a single '{APP_TITLE}' window")
+
+
 def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Event, log):
     if not netids:
         log("No NetIDs provided.\n")
         return
+
+    run_start = time.perf_counter()
+    processed_count = 0
 
     action_counter = 0
 
@@ -113,14 +197,18 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
     log("Connecting to application...\n")
     log("(Press ABORT anytime to stop)\n\n")
 
-    app_win32 = Application(backend="win32").connect(title_re=APP_TITLE)
-    main_win32 = app_win32.window(title_re=APP_TITLE)
+    app_win32, main_win32 = _connect_single_main_window(abort_event, log, timeout=15.0, key_delay=cfg.key_delay)
     main_win32.wait("ready", timeout=10)
     log(f"Connected: {main_win32.window_text()}\n")
 
     def click_main(coords: tuple[int, int], label: str):
         if abort_event.is_set():
             raise AbortRequested()
+
+        if label == "Assign Access":
+            log("\n" + ("*" * 56) + "\n")
+            log("********************  ASSIGN ACCESS CLICK  ********************\n")
+            log(("*" * 56) + "\n")
         try:
             rect = main_win32.rectangle()
             approx_screen = (rect.left + coords[0], rect.top + coords[1])
@@ -129,12 +217,16 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
             log_action(f"CLICK {label} @ {coords}")
         main_win32.click_input(coords=coords)
 
-    for netid in netids:
+    main_pid = _get_pid_for_hwnd(int(main_win32.handle))
+
+    for idx, netid in enumerate(netids):
         if abort_event.is_set():
             raise AbortRequested()
 
-        # Give the prior confirmation popup time to close before starting next user
-        _sleep_or_abort(cfg.between_users_delay, abort_event)
+        # Confirm there is only one Area Access Manager window present.
+        # If not, press Enter repeatedly (up to 15s) to clear any lingering dialog.
+        app_win32, main_win32 = _connect_single_main_window(abort_event, log, timeout=15.0, key_delay=cfg.key_delay)
+        main_win32.wait("ready", timeout=10)
         log(f"Processing {netid}\n")
 
         # Click Assign Access
@@ -160,7 +252,7 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
         if wizard_window is None:
             raise RuntimeError("Wizard window did not appear after 15 seconds")
 
-        # Click 2nd tab (UWID) — coordinate-based
+        # Click UWID tab — coordinate-based (explicitly required)
         log("Clicking UWID tab\n")
         click_main(cfg.tab_2_click_rel, "UWID tab")
         _sleep_or_abort(cfg.click_delay, abort_event)
@@ -181,72 +273,142 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
         except Exception:
             pass
         press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Next: Enter
-        log("Next (Step 2/4 -> 3/4) via Enter\n")
-        try:
-            wizard_window.set_focus()
-        except Exception:
-            pass
+        # Validate NetID using window-count rule:
+        # After pressing Enter, if NetID is invalid AAM shows a popup, yielding 3 windows
+        # for the AAM process instead of 2. Proceed only if count == 2.
+        def popup_detected_after_enter(observe_seconds: float) -> bool:
+            # IMPORTANT: don't short-circuit when we see 2 windows immediately.
+            # The popup can appear a fraction of a second later.
+            deadline = time.time() + max(0.0, observe_seconds)
+            max_count = -1
+            last_count = None
+
+            while time.time() < deadline:
+                if abort_event.is_set():
+                    raise AbortRequested()
+                c = _count_visible_toplevel_windows_for_pid(main_pid)
+                last_count = c
+                max_count = max(max_count, c)
+                if c > 2:
+                    return True
+                time.sleep(0.05)
+
+            if cfg.debug_actions and last_count is not None:
+                log_action(f"AAM windows after Enter: last={last_count}, max={max_count}")
+            return False
+
+        global _RESUME_HOOKS
+        _sleep_or_abort(cfg.key_delay, abort_event)
+        if popup_detected_after_enter(1.5):
+            if _RESUME_HOOKS is None:
+                raise RuntimeError("Resume requested but GUI hooks not initialized")
+
+            while True:
+                if abort_event.is_set():
+                    raise AbortRequested()
+
+                current_count = _count_visible_toplevel_windows_for_pid(main_pid)
+                log(
+                    "\nPAUSED: NetID may be invalid (popup detected).\n"
+                    "Correct the NetID typo, press 'Next' in Area Access Manager, and then press 'Resume' Here.\n"
+                    f"(Debug: observed {current_count} Area Access Manager window(s).)\n"
+                    "(No keys/clicks will be sent while paused.)\n\n"
+                )
+
+                _RESUME_HOOKS['resume_event'].clear()
+                _RESUME_HOOKS['enable_resume']()
+
+                while not _RESUME_HOOKS['resume_event'].is_set():
+                    if abort_event.is_set():
+                        raise AbortRequested()
+                    time.sleep(0.1)
+
+                _RESUME_HOOKS['disable_resume']()
+
+                # User-driven recovery: do not press Enter automatically.
+                # We only proceed once the popup is gone (no extra window).
+                # Keep checking until count is back to 2.
+                deadline = time.time() + 15.0
+                while time.time() < deadline:
+                    if abort_event.is_set():
+                        raise AbortRequested()
+                    if _count_visible_toplevel_windows_for_pid(main_pid) == 2:
+                        break
+                    time.sleep(0.1)
+
+                if _count_visible_toplevel_windows_for_pid(main_pid) == 2:
+                    # RESUME clicks shift focus to the GUI. Re-focus the wizard so the
+                    # remaining keyboard automation goes to Area Access Manager.
+                    try:
+                        wizard_window.set_focus()
+                    except Exception:
+                        try:
+                            main_win32.set_focus()
+                        except Exception:
+                            pass
+                    _sleep_or_abort(0.2, abort_event)
+                    break
+
+        
+        # Continue keyboard-only sequence (exactly as specified)
+        # Enter
+        log("Enter\n")
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Set Activation Dates: Tab then Enter
-        log("Set Activation Dates via Tab+Enter\n")
-        try:
-            wizard_window.set_focus()
-        except Exception:
-            pass
+        # Tab
+        log("Tab\n")
         press('tab')
         _sleep_or_abort(cfg.key_delay, abort_event)
+
+        # Enter
+        log("Enter\n")
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Activation Dates popup OK: Enter
-        log("OK in Activation Dates popup via Enter\n")
+        # New window pops up; OK with Enter
+        log("Enter (popup)\n")
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Next: Tab x4 then Enter
-        log("Next (Step 3/4 -> 4/4) via Tab x4 + Enter\n")
-        try:
-            wizard_window.set_focus()
-        except Exception:
-            pass
+        # Tab x4 then Enter
+        log("Tab x4 + Enter\n")
         for _ in range(4):
             press('tab')
             _sleep_or_abort(cfg.key_delay, abort_event)
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Finish: Enter
-        log("Finish via Enter\n")
-        try:
-            wizard_window.set_focus()
-        except Exception:
-            pass
+        # Enter
+        log("Enter\n")
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Final confirmation OK: Enter (no coordinates)
-        log("Clicking OK in confirmation popup (pressing Enter)\n")
-        try:
-            wizard_window.set_focus()
-        except Exception:
-            pass
-        _sleep_or_abort(0.2, abort_event)
+        # Enter
+        log("Enter\n")
         press('enter')
         _sleep_or_abort(cfg.key_delay, abort_event)
+
+        # Wait key delay * 10
+        log("Waiting (key_delay * 10)\n")
+        _sleep_or_abort(cfg.key_delay * 10, abort_event)
+
+        # Enter
+        log("Enter\n")
+        press('enter')
 
         log(f"Completed {netid}\n\n")
+        processed_count += 1
 
+    elapsed = time.perf_counter() - run_start
     log("All users processed.\n")
+    log(f"Total users processed: {processed_count}\n")
+    log(f"Total processing time: {elapsed:.1f} seconds\n")
 
 
 def run_coord_check(cfg: Config, abort_event: threading.Event, log):
-    app_win32 = Application(backend="win32").connect(title_re=APP_TITLE)
-    main_win32 = app_win32.window(title_re=APP_TITLE)
+    app_win32, main_win32 = _connect_single_main_window(abort_event, log, timeout=15.0, key_delay=cfg.key_delay)
     main_win32.wait("ready", timeout=10)
     rect = main_win32.rectangle()
 
@@ -295,6 +457,7 @@ class App(tk.Tk):
 
         self.cfg = Config()
         self.abort_event = threading.Event()
+        self.resume_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
 
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -328,6 +491,9 @@ class App(tk.Tk):
 
         self.btn_assign = ttk.Button(btn_row, text="Assign Access", command=self.on_assign_access)
         self.btn_assign.pack(side="left")
+
+        self.btn_resume = ttk.Button(btn_row, text="RESUME", command=self.on_resume, state="disabled")
+        self.btn_resume.pack(side="left", padx=(8, 0))
 
         ttk.Button(btn_row, text="Help", command=lambda: messagebox.showinfo("Help", DISCLAIMER_TEXT)).pack(
             side="left", padx=(8, 0)
@@ -527,12 +693,25 @@ class App(tk.Tk):
         state = "disabled" if running else "normal"
         self.btn_assign.configure(state=state)
         self.btn_coord.configure(state=state)
+        # Resume only enabled when a pause is requested
+        if not running:
+            self.btn_resume.configure(state="disabled")
         # ABORT should always be enabled
+
+    def _set_resume_state(self, enabled: bool):
+        self.btn_resume.configure(state=("normal" if enabled else "disabled"))
 
     def on_abort(self):
         self.abort_event.set()
+        # If we're paused waiting on Resume, unblock it.
+        self.resume_event.set()
         self._log("main", "\nABORT requested. Stopping...\n")
         self._log("adv", "\nABORT requested. Stopping...\n")
+
+    def on_resume(self):
+        self.resume_event.set()
+        self._set_resume_state(False)
+        self._log("main", "\nRESUME pressed.\n")
 
     def on_assign_access(self):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -550,7 +729,16 @@ class App(tk.Tk):
             return
 
         self.abort_event.clear()
+        self.resume_event.clear()
         self._set_running_state(True)
+
+        # Expose resume hooks to the automation engine
+        global _RESUME_HOOKS
+        _RESUME_HOOKS = {
+            'resume_event': self.resume_event,
+            'enable_resume': lambda: self.after(0, lambda: self._set_resume_state(True)),
+            'disable_resume': lambda: self.after(0, lambda: self._set_resume_state(False)),
+        }
 
         def worker():
             try:
@@ -560,6 +748,9 @@ class App(tk.Tk):
             except Exception as e:
                 self._log("main", f"\nERROR: {e}\n")
             finally:
+                # Clear hooks when done
+                global _RESUME_HOOKS
+                _RESUME_HOOKS = None
                 self.after(0, lambda: self._set_running_state(False))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
