@@ -18,6 +18,8 @@ import ctypes
 import keyboard
 from pywinauto import Application, findwindows
 
+import statistics
+
 
 # ----------------------------
 # Defaults / Configuration
@@ -26,6 +28,17 @@ from pywinauto import Application, findwindows
 APP_TITLE = "Area Access Manager"
 
 REPO_URL = "https://github.com/cwbaxter22/ExpeditedAccess"
+APP_ICON_ICO = "genie_lamp_retro.ico"
+
+
+def _resource_path(relative_name: str) -> str:
+    """Return an absolute path to a bundled resource.
+
+    Works for both normal `python openSesame.py` runs and PyInstaller onefile builds.
+    """
+
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_name)
 
 # Set by the GUI at runtime so the automation can request a user-driven Resume.
 _RESUME_HOOKS = None
@@ -83,6 +96,10 @@ ADVANCED_HELP_TEXT = (
 def _settings_file_path() -> Path:
     base = os.getenv("APPDATA") or str(Path.home())
     return Path(base) / "ExpeditedAccess" / "settings.json"
+
+# Toggle for showing the snip/ocr debug plot; enable for current debugging session.
+SHOW_DEBUG_PLOT = False
+
 
 
 def _default_config() -> Config:
@@ -238,6 +255,315 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
         log_action(f"KEY {keys}")
         keyboard.press_and_release(keys)
 
+    _EASYOCR_READER = None
+
+    def _detect_text_regions(
+        image_input,
+    ) -> list[tuple]:
+        """Detect text using EasyOCR. Return list of bboxes.
+
+        Accepts numpy array (H x W) uint8 preferred. Returns list of
+        (x_min, y_min, x_max, y_max, text, confidence).
+        """
+
+        try:
+            import warnings
+            import easyocr  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Missing EasyOCR dependency for text detection. Install with `pip install easyocr`. "
+                f"Details: {e}"
+            )
+
+        # EasyOCR uses torch under the hood; suppress a common CPU-only warning.
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*pin_memory.*no accelerator is found.*",
+            category=UserWarning,
+        )
+
+        # Ensure numpy array input for EasyOCR
+        if not isinstance(image_input, np.ndarray):
+            image_np = np.array(image_input, dtype=np.uint8)
+        else:
+            image_np = image_input.astype(np.uint8, copy=False)
+
+        # Initialize reader once (on first call, downloads ~200MB model)
+        nonlocal _EASYOCR_READER
+        if _EASYOCR_READER is None:
+            _EASYOCR_READER = easyocr.Reader(['en'], gpu=False)
+        reader = _EASYOCR_READER
+        results = reader.readtext(image_np)
+
+        # results is a list of: (bbox_coords, text, confidence)
+        # bbox_coords is: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] (4 corners)
+        detections = []
+
+        for (bbox_coords, text, confidence) in results:
+            xs = [pt[0] for pt in bbox_coords]
+            ys = [pt[1] for pt in bbox_coords]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            detections.append((int(x_min), int(y_min), int(x_max), int(y_max), text, confidence))
+
+        return detections
+
+    def _evaluate_assignment_screen(detections: list[tuple]) -> tuple[str, list[tuple], dict]:
+        """Evaluate OCR detections to decide single vs multiple user.
+
+        Returns (status, bboxes_used, constraint_bounds) where status is one of:
+        - 'title_missing'
+        - 'label_missing'
+        - 'single_user'
+        - 'multiple_users'
+
+        Uses word count: 2 words = 1 user, >2 words = multiple users.
+        constraint_bounds is a dict with 'label_y', 'label_x_min', 'y_max', 'x_max' if applicable, else None.
+        """
+
+        def _norm(s: str) -> str:
+            return " ".join((s or "").lower().strip().split())
+
+        def _is_title(s: str) -> bool:
+            t = _norm(s)
+            if "select the people you" in t:
+                return True
+            if "access level assignment wizard" in t:
+                return True
+            if "access level assignment" in t:
+                return True
+            # Tolerate minor OCR variation: require core keywords.
+            words = set(t.replace("-", " ").split())
+            has_assign = any(w.startswith("assign") for w in words)
+            has_wiz = any(w.startswith("wiz") for w in words)
+            return ("access" in words) and ("level" in words) and has_assign and has_wiz
+
+        # Locate title
+        title_y = None
+        for x_min, y_min, x_max, y_max, text, conf in detections:
+            if _is_title(text):
+                title_y = y_max
+                break
+
+        if title_y is None:
+            return "title_missing", [], None
+
+        # Find Last Name (preferred) or First Name below title
+        label_y = None
+        label_x_min = None
+        label_bbox = None
+        below_title = [d for d in detections if d[1] > title_y]
+        below_title.sort(key=lambda d: d[1])
+
+        def _is_label(s: str, kind: str) -> bool:
+            t = _norm(s)
+            return kind in t
+
+        for x_min, y_min, x_max, y_max, text, conf in below_title:
+            if _is_label(text, "last name"):
+                label_y = y_max
+                label_x_min = x_min
+                label_bbox = (x_min, y_min, x_max, y_max, text, conf)
+                break
+
+        if label_y is None:
+            for x_min, y_min, x_max, y_max, text, conf in below_title:
+                if _is_label(text, "first name"):
+                    label_y = y_max
+                    label_x_min = x_min
+                    label_bbox = (x_min, y_min, x_max, y_max, text, conf)
+                    break
+
+        if label_y is None:
+            return "label_missing", [], None
+
+        # Crop: remove everything with x-value less than label_x_min
+        cropped_detections = [d for d in detections if d[0] >= label_x_min]
+
+        # Rows below label: only search within 100px below label_y
+        # Shift constraint by 5 pixels on Y-axis only
+        constraint_y_max = label_y + 100 + 5
+        constraint_x_max = label_x_min + 100
+        constraint_bounds = {
+            "label_y": label_y + 5,
+            "label_x_min": label_x_min,
+            "y_max": constraint_y_max,
+            "x_max": constraint_x_max,
+        }
+
+        below = [
+            d for d in cropped_detections
+            if d[1] > label_y and d[1] <= constraint_y_max and d[0] <= constraint_x_max
+        ]
+
+        if not below:
+            return "single_user", [label_bbox], constraint_bounds
+
+        # Count words ONLY within the bounding box
+        word_count = sum(len(d[4].split()) for d in below)
+
+        if cfg.debug_actions:
+            counted_text = " | ".join([d[4] for d in below])
+            log_action(f"OCR word_count_in_box={word_count}; texts={counted_text}")
+
+        # <= 2 words = 1 user (e.g., "Last Name"), > 2 words = multiple users
+        status = "multiple_users" if word_count > 2 else "single_user"
+        used = [label_bbox] + below
+        return status, used, constraint_bounds
+
+    def _grab_grayscale_intensity_array(
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[list[list[int]], dict[str, float]]:
+        """Grab a screen region and return (2D intensities, summary stats).
+
+        Intensities are 0..255 (0=black, 255=white).
+        `bbox` is (left, top, right, bottom) in screen coordinates.
+        """
+
+        try:
+            from PIL import ImageGrab  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Missing Pillow dependency for screen capture. Install with `pip install pillow`. "
+                f"Details: {e}"
+            )
+
+        if bbox == (0, 0, 0, 0):
+            img = ImageGrab.grab().convert("L")
+        else:
+            img = ImageGrab.grab(bbox).convert("L")
+        w, h = img.size
+
+        # Use get_flattened_data when available to avoid Pillow deprecation warning.
+        if hasattr(img, "get_flattened_data"):
+            flat_seq = img.get_flattened_data()
+        else:
+            flat_seq = img.getdata()
+
+        flat = list(flat_seq)
+        # Reshape into row-major 2D list for easy indexing in hover callback.
+        arr2d = [flat[i * w:(i + 1) * w] for i in range(h)]
+
+        mean_v = float(sum(flat) / len(flat))
+        median_v = float(statistics.median(flat))
+        std_v = float(statistics.pstdev(flat))
+        stats = {
+            "mean": mean_v,
+            "median": median_v,
+            "std": std_v,
+            "min": float(min(flat)),
+            "max": float(max(flat)),
+        }
+        return arr2d, stats
+
+    def _show_snip_debug_plot(
+        arr2d: list[list[int]],
+        stats: dict[str, float],
+        *,
+        netid: str,
+        bbox: tuple[int, int, int, int],
+        detections: list = None,
+        status: str = "unknown",
+        constraint_bounds: dict = None,
+    ):
+        """Show a hoverable Matplotlib plot of the snipped region with OCR bboxes and search constraint."""
+
+        if not SHOW_DEBUG_PLOT:
+            return
+
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            from matplotlib.gridspec import GridSpec  # type: ignore
+            from matplotlib.patches import Rectangle  # type: ignore
+            import warnings
+        except Exception as e:
+            raise RuntimeError(
+                "Missing Matplotlib dependency for debug plots. Install with `pip install matplotlib`. "
+                f"Details: {e}"
+            )
+
+        # Suppress main-thread GUI warning (we're intentionally in a worker thread).
+        warnings.filterwarnings("ignore", message="Starting a Matplotlib GUI outside of the main thread")
+
+        h = len(arr2d)
+        w = len(arr2d[0]) if h else 0
+
+        fig = plt.figure(figsize=(10, 5))
+        gs = GridSpec(1, 2, width_ratios=[5, 2], figure=fig)
+        ax = fig.add_subplot(gs[0, 0])
+        axr = fig.add_subplot(gs[0, 1])
+
+        im = ax.imshow(arr2d, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+        ax.set_title(f"NetID snip debug: {netid}\nStatus: {status}")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+
+        # Draw yellow constraint box if available
+        if constraint_bounds:
+            label_y = constraint_bounds.get("label_y", 0)
+            label_x_min = constraint_bounds.get("label_x_min", 0)
+            y_max = constraint_bounds.get("y_max", 0)
+            x_max = constraint_bounds.get("x_max", 0)
+            rect_constraint = Rectangle(
+                (label_x_min, label_y),
+                x_max - label_x_min,
+                y_max - label_y,
+                linewidth=3,
+                edgecolor="yellow",
+                facecolor="none",
+            )
+            ax.add_patch(rect_constraint)
+
+        # Draw bounding boxes from OCR detections
+        if detections:
+            for x_min, y_min, x_max, y_max, text, conf in detections:
+                rect = Rectangle(
+                    (x_min, y_min),
+                    x_max - x_min,
+                    y_max - y_min,
+                    linewidth=2,
+                    edgecolor="red",
+                    facecolor="none",
+                )
+                ax.add_patch(rect)
+                ax.text(x_min, y_min - 5, f"{text[:15]}({conf:.2f})", color="red", fontsize=8)
+
+        try:
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        except Exception:
+            pass
+
+        axr.axis("off")
+        stats_text = (
+            "Intensity stats (0..255)\n"
+            f"mean:   {stats['mean']:.2f}\n"
+            f"median: {stats['median']:.2f}\n"
+            f"std:    {stats['std']:.2f}\n"
+            f"min:    {stats['min']:.0f}\n"
+            f"max:    {stats['max']:.0f}\n\n"
+            f"Status: {status}\n\n"
+            "Yellow box = search area\n"
+            "Red boxes = detected text\n"
+            "Close to continue"
+        )
+        axr_text = axr.text(0.0, 1.0, stats_text, va="top", ha="left", family="monospace")
+        hover_text = axr.text(0.0, 0.05, "hover: (x=?, y=?)\nI=?", va="bottom", ha="left", family="monospace")
+
+        def on_move(event):
+            if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+                return
+            x = int(event.xdata + 0.5)
+            y = int(event.ydata + 0.5)
+            if 0 <= x < w and 0 <= y < h:
+                val = arr2d[y][x]
+                hover_text.set_text(f"hover: (x={x}, y={y})\nI={val}")
+                fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect("motion_notify_event", on_move)
+        plt.tight_layout()
+        plt.show(block=True)
+
     log("Connecting to application...\n")
     log("(Press ABORT anytime to stop)\n\n")
 
@@ -318,6 +644,102 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
             pass
         press('enter')
 
+        # After Enter, evaluate full-screen OCR for ambiguity (multiple users).
+        # Keep looping until we see the title; then decide single vs multiple users.
+        import numpy as np  # type: ignore
+        ocr_status = "title_missing"
+        detections: list[tuple] = []
+        first_attempt = True
+
+        while True:
+            if abort_event.is_set():
+                raise AbortRequested()
+
+            # Log status before capturing
+            if ocr_status == "title_missing":
+                if first_attempt:
+                    log("Imaging\n")
+                    first_attempt = False
+                else:
+                    log("Re-imaging\n")
+            else:
+                log("Analyzing\n")
+
+            _sleep_or_abort(cfg.click_delay * 10, abort_event)
+            # Snip only the top half of the screen (faster than full-screen OCR)
+            import ctypes
+            user32 = ctypes.windll.user32
+            screen_w = int(user32.GetSystemMetrics(0))
+            screen_h = int(user32.GetSystemMetrics(1))
+            top_half_bbox = (0, 0, screen_w, max(1, screen_h // 2))
+            full_arr2d, full_stats = _grab_grayscale_intensity_array(top_half_bbox)
+            try:
+                img_array = np.array(full_arr2d, dtype=np.uint8)
+                detections = _detect_text_regions(img_array)
+                ocr_status, used_boxes, constraint_bounds = _evaluate_assignment_screen(detections)
+            except Exception as ocr_err:
+                log(f"[OCR] Warning: {ocr_err}\n")
+                ocr_status = "ocr_failed"
+                used_boxes = []
+                constraint_bounds = None
+
+            if ocr_status == "title_missing":
+                continue
+            if ocr_status == "label_missing":
+                # Keep trying; UI may still be rendering.
+                continue
+
+            # single_user or multiple_users or ocr_failed
+            _show_snip_debug_plot(full_arr2d, full_stats, netid=netid, bbox=(0, 0, 0, 0), detections=used_boxes, status=ocr_status, constraint_bounds=constraint_bounds)
+
+            if ocr_status == "multiple_users":
+                if _RESUME_HOOKS is None:
+                    raise RuntimeError("Resume requested but GUI hooks not initialized")
+
+                log(
+                    "\nPAUSED: More than one user detected.\n"
+                    "Please select the correct user in Area Access Manager, press Enter there, then press Resume here.\n"
+                    "(No keys/clicks will be sent while paused.)\n\n"
+                )
+
+                _RESUME_HOOKS['resume_event'].clear()
+                _RESUME_HOOKS['enable_resume']()
+
+                while not _RESUME_HOOKS['resume_event'].is_set():
+                    if abort_event.is_set():
+                        raise AbortRequested()
+                    time.sleep(0.1)
+
+                _RESUME_HOOKS['disable_resume']()
+                # RESUME clicks shift focus to the GUI. Re-focus Area Access Manager
+                # so the remaining keyboard automation goes to the correct window.
+                try:
+                    wizard_window.set_focus()
+                except Exception:
+                    try:
+                        main_win32.set_focus()
+                    except Exception:
+                        pass
+                _sleep_or_abort(0.2, abort_event)
+                break  # user handled selection; proceed
+
+            elif ocr_status == "single_user":
+                # Proceed automatically
+                break
+            else:
+                # ocr_failed: proceed without pausing
+                break
+
+        # Ensure keyboard focus is back on Area Access Manager before continuing.
+        try:
+            wizard_window.set_focus()
+        except Exception:
+            try:
+                main_win32.set_focus()
+            except Exception:
+                pass
+        _sleep_or_abort(0.1, abort_event)
+
         # Validate NetID using window-count rule:
         # After pressing Enter, if NetID is invalid AAM shows a popup, yielding 3 windows
         # for the AAM process instead of 2. Proceed only if count == 2.
@@ -342,7 +764,109 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
                 log_action(f"AAM windows after Enter: last={last_count}, max={max_count}")
             return False
 
-        global _RESUME_HOOKS
+        def wait_for_popup_and_dismiss(timeout_seconds: float, label: str) -> bool:
+            """Wait for an AAM popup (extra top-level window) then dismiss with Enter.
+
+            Returns True if a popup was observed and dismissed, else False.
+            """
+            deadline = time.time() + max(0.0, timeout_seconds)
+            saw_popup = False
+
+            def _try_dismiss_extra_aam_window() -> bool:
+                """If an extra AAM dialog exists, focus it and click OK (fallback: Enter)."""
+                try:
+                    elements = findwindows.find_elements(title_re=APP_TITLE)
+                except Exception:
+                    return False
+
+                def _safe_handle(win) -> int:
+                    try:
+                        return int(getattr(win, "handle"))
+                    except Exception:
+                        return 0
+
+                main_handle = _safe_handle(main_win32)
+                wizard_handle = _safe_handle(wizard_window)
+
+                for el in elements:
+                    try:
+                        h = int(el.handle)
+                    except Exception:
+                        continue
+
+                    if h in (0, main_handle, wizard_handle):
+                        continue
+
+                    try:
+                        dlg_app = Application(backend="win32").connect(handle=h)
+                        dlg = dlg_app.window(handle=h)
+                        try:
+                            dlg.set_focus()
+                        except Exception:
+                            pass
+
+                        # Prefer clicking OK (some dialogs ignore Enter if focus isn't right).
+                        try:
+                            ok_btn = dlg.child_window(title_re=r"^OK$", class_name="Button")
+                            if ok_btn.exists(timeout=0.2):
+                                ok_btn.click_input()
+                                return True
+                        except Exception:
+                            pass
+
+                        # Fallback: send Enter to dismiss.
+                        press('enter')
+                        return True
+                    except Exception:
+                        continue
+
+                return False
+
+            while time.time() < deadline:
+                if abort_event.is_set():
+                    raise AbortRequested()
+
+                # Some popups don't reliably show up in the PID window-count heuristic.
+                # Try direct window discovery first.
+                if _try_dismiss_extra_aam_window():
+                    saw_popup = True
+                    return True
+
+                c = _count_visible_toplevel_windows_for_pid(main_pid)
+                if c > 2:
+                    saw_popup = True
+                    if cfg.debug_actions:
+                        log_action(f"Popup detected ({label}); windows={c}; dismissing with Enter")
+                    try:
+                        wizard_window.set_focus()
+                    except Exception:
+                        try:
+                            main_win32.set_focus()
+                        except Exception:
+                            pass
+                    press('enter')
+
+                    # Wait for popup to clear.
+                    clear_deadline = time.time() + 5.0
+                    while time.time() < clear_deadline:
+                        if abort_event.is_set():
+                            raise AbortRequested()
+                        if _count_visible_toplevel_windows_for_pid(main_pid) <= 2:
+                            return True
+                        time.sleep(0.05)
+
+                    return True
+
+                time.sleep(0.05)
+
+            return saw_popup
+
+        # Start the exact key sequence here.
+        # For multiple-user, the user already pressed the first Enter manually before hitting Resume.
+        if ocr_status != "multiple_users":
+            log("Enter\n")
+            press('enter')
+
         _sleep_or_abort(cfg.key_delay, abort_event)
         if popup_detected_after_enter(1.5):
             if _RESUME_HOOKS is None:
@@ -394,53 +918,93 @@ def run_assign_access(netids: list[str], cfg: Config, abort_event: threading.Eve
                     _sleep_or_abort(0.2, abort_event)
                     break
 
-        
-        # Continue keyboard-only sequence (exactly as specified)
-        # Enter
-        log("Enter\n")
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
+        if ocr_status == "single_user":
+            # (First Enter already sent above, before popup detection)
 
-        # Tab
-        log("Tab\n")
-        press('tab')
-        _sleep_or_abort(cfg.key_delay, abort_event)
-
-        # Enter
-        log("Enter\n")
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
-
-        # New window pops up; OK with Enter
-        log("Enter (popup)\n")
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
-
-        # Tab x4 then Enter
-        log("Tab x4 + Enter\n")
-        for _ in range(4):
+            log("Tab\n")
             press('tab')
             _sleep_or_abort(cfg.key_delay, abort_event)
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Enter
-        log("Enter\n")
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Enter
-        log("Enter\n")
-        press('enter')
-        _sleep_or_abort(cfg.key_delay, abort_event)
+            log("Enter (popup)\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Wait key delay * 10
-        log("Waiting (key_delay * 10)\n")
-        _sleep_or_abort(cfg.key_delay * 10, abort_event)
+            # Tab x4 then Enter
+            log("Tab x4 + Enter\n")
+            for _ in range(4):
+                press('tab')
+                _sleep_or_abort(cfg.key_delay, abort_event)
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
 
-        # Enter
-        log("Enter\n")
-        press('enter')
+            # Enter
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Enter
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Wait key delay * 10
+            log("Waiting (key_delay * 10)\n")
+            _sleep_or_abort(cfg.key_delay * 10, abort_event)
+
+            # Final Enter to trigger the final confirmation dialog (if any)
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            
+        else:
+            # Match the single-user workflow from this point forward.
+            # (First Enter is skipped only for multiple_users; it was handled manually.)
+
+            # Tab
+            log("Tab\n")
+            press('tab')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Enter
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # New window pops up; OK with Enter
+            log("Enter (popup)\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Tab x4 then Enter
+            log("Tab x4 + Enter\n")
+            for _ in range(4):
+                press('tab')
+                _sleep_or_abort(cfg.key_delay, abort_event)
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Enter
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Enter
+            log("Enter\n")
+            press('enter')
+            _sleep_or_abort(cfg.key_delay, abort_event)
+
+            # Wait key delay * 10
+            log("Waiting (key_delay * 10)\n")
+            _sleep_or_abort(cfg.key_delay * 10, abort_event)
+
+            # Enter
+            log("Enter\n")
+            press('enter')
 
         log(f"Completed {netid}\n\n")
         processed_count += 1
@@ -496,8 +1060,15 @@ class TextSink:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Expedited Access")
+        self.title("Open Sesame")
         self.geometry("900x650")
+
+        # Set window/taskbar icon (Windows requires .ico).
+        try:
+            self.iconbitmap(_resource_path(APP_ICON_ICO))
+        except Exception:
+            # If the icon isn't found (or in unsupported environments), keep default.
+            pass
 
         self.settings_path = _settings_file_path()
         self.cfg = _default_config()
